@@ -149,6 +149,21 @@ class H2Configuration:
         .. versionadded:: 2.6.0
 
     :type logger: ``logging.Logger``
+
+    :param receive_credentials: Controls whether
+        :class:`DataReceived <h2.events.DataReceived>` events carry a
+        :class:`ReceiveCredential <h2.receive_credential.ReceiveCredential>`
+        that the application can redeem to hand flow control window space
+        back, instead of accumulating bytes for
+        :meth:`acknowledge_received_data
+        <h2.connection.H2Connection.acknowledge_received_data>`. When enabled,
+        plain acknowledgement is refused on any stream that has been accounted
+        for through credentials, so the two accounting styles cannot
+        double-count. Defaults to ``False``.
+
+        .. versionadded:: 4.5.0
+
+    :type receive_credentials: ``bool``
     """
 
     client_side = _BooleanConfigOption("client_side")
@@ -167,6 +182,7 @@ class H2Configuration:
     normalize_inbound_headers = _BooleanConfigOption(
         "normalize_inbound_headers",
     )
+    receive_credentials = _BooleanConfigOption("receive_credentials")
 
     def __init__(self,
                  client_side: bool = True,
@@ -176,6 +192,7 @@ class H2Configuration:
                  split_outbound_cookies: bool = False,
                  validate_inbound_headers: bool = True,
                  normalize_inbound_headers: bool = True,
+                 receive_credentials: bool = False,
                  logger: DummyLogger | OutputLogger | None = None) -> None:
         self.client_side = client_side
         self.header_encoding = header_encoding
@@ -184,6 +201,7 @@ class H2Configuration:
         self.split_outbound_cookies = split_outbound_cookies
         self.validate_inbound_headers = validate_inbound_headers
         self.normalize_inbound_headers = normalize_inbound_headers
+        self.receive_credentials = receive_credentials
         self.logger = logger or DummyLogger(__name__)
 
     @property

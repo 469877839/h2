@@ -34,6 +34,7 @@ from .errors import ErrorCodes, _error_code_from_int
 from .events import (
     AlternativeServiceAvailable,
     ConnectionTerminated,
+    DataReceived,
     Event,
     InformationalResponseReceived,
     PingAckReceived,
@@ -55,11 +56,13 @@ from .exceptions import (
     NoSuchStreamError,
     ProtocolError,
     RFC1122Error,
+    ReceiveCredentialError,
     StreamClosedError,
     StreamIDTooLowError,
     TooManyStreamsError,
 )
 from .frame_buffer import FrameBuffer
+from .receive_credential import ReceiveCredential
 from .settings import ChangedSetting, SettingCodes, Settings
 from .stream import H2Stream, StreamClosedBy
 from .utilities import SizeLimitDict, guard_increment_window
@@ -399,6 +402,25 @@ class H2Connection:
         # The flow control window manager for the connection.
         self._inbound_flow_control_window_manager = WindowManager(
             max_window_size=self.local_settings.initial_window_size,
+        )
+
+        # Stream IDs whose received data is accounted for through
+        # ReceiveCredential objects. On these streams the plain
+        # acknowledge_received_data() accounting is refused for the lifetime
+        # of the stream, so the same bytes cannot be returned to the remote
+        # peer twice. Membership is sticky: it survives full redemption and
+        # RST_STREAM, which keeps a late acknowledge_received_data() call from
+        # manufacturing window space for bytes a credential already settled.
+        self._credential_streams: SizeLimitDict[int, None] = SizeLimitDict(
+            size_limit=self.MAX_CLOSED_STREAMS,
+        )
+
+        # Stream IDs that have been torn down by a RST_STREAM while they had
+        # unredeemed credentials. The connection window was already topped up
+        # for those bytes, so any later redemption attempt must be refused:
+        # otherwise the same quota could be handed back twice.
+        self._settled_credential_streams: SizeLimitDict[int, None] = SizeLimitDict(
+            size_limit=self.MAX_CLOSED_STREAMS,
         )
 
         # When in doubt use dict-dispatch.
@@ -1073,6 +1095,7 @@ class H2Connection:
         self.state_machine.process_input(ConnectionInputs.SEND_RST_STREAM)
         stream = self._get_stream_by_id(stream_id)
         frames = stream.reset_stream(error_code)
+        self._settle_stream_credentials(stream_id)
         self._prepare_for_sending(frames)
 
     def close_connection(self,
@@ -1370,6 +1393,13 @@ class H2Connection:
         if acknowledged_size < 0:
             msg = "Cannot acknowledge negative data"
             raise ValueError(msg)
+        if stream_id in self._credential_streams:
+            msg = (
+                f"Stream {stream_id} is accounted for by ReceiveCredential "
+                "objects: mixing acknowledge_received_data with credentials "
+                "would count the same bytes twice"
+            )
+            raise ReceiveCredentialError(msg)
 
         frames: list[Frame] = []
 
@@ -1394,6 +1424,88 @@ class H2Connection:
                 )
 
         self._prepare_for_sending(frames)
+
+    def _redeem_receive_credential(
+        self,
+        credential: ReceiveCredential,
+        size: int,
+    ) -> None:
+        """
+        Return ``size`` flow-controlled bytes covered by ``credential`` to the
+        connection and stream windows through the automatic flow control
+        logic. All validation (connection binding, bounds, repeat completion)
+        is performed by the credential itself before this is called.
+        """
+        stream_id = credential.stream_id
+        self.config.logger.debug(
+            "Redeem ReceiveCredential on stream ID %d with size %d",
+            stream_id, size,
+        )
+
+        if stream_id in self._settled_credential_streams:
+            msg = (
+                f"ReceiveCredential on stream {stream_id} was already settled "
+                "when the stream was reset; its bytes were returned to the "
+                "connection window and cannot be redeemed again"
+            )
+            raise ReceiveCredentialError(msg)
+
+        frames: list[Frame] = []
+        conn_increment = self._inbound_flow_control_window_manager.process_bytes(
+            size,
+        )
+        if conn_increment:
+            f = WindowUpdateFrame(0)
+            f.window_increment = conn_increment
+            frames.append(f)
+
+        try:
+            stream = self._get_stream_by_id(stream_id)
+        except NoSuchStreamError:
+            # The stream has been cleaned up. Its window no longer exists, so
+            # only the connection window can be handed back.
+            pass
+        else:
+            stream._unredeemed_received_bytes -= size
+            if stream.open:
+                frames.extend(stream.acknowledge_received_data(size))
+
+        self._prepare_for_sending(frames)
+
+    def _settle_stream_credentials(self, stream_id: int) -> None:
+        """
+        Close out credential accounting for a stream that is being torn down
+        by a RST_STREAM. The still-unredeemed flow-controlled bytes are given
+        back to the *connection* window only: the stream window is dead and
+        must not be resurrected. This keeps the connection from stalling while
+        ensuring no stream-level WINDOW_UPDATE is ever emitted for a reset
+        stream.
+        """
+        if stream_id not in self._credential_streams:
+            # This stream is not on the credential accounting path (either the
+            # feature is disabled or no DATA frames were ever received).
+            return
+
+        try:
+            stream = self._get_stream_by_id(stream_id)
+        except NoSuchStreamError:
+            # Already cleaned up: nothing outstanding can be settled here.
+            return
+
+        outstanding = stream._unredeemed_received_bytes
+        if outstanding:
+            conn_increment = self._inbound_flow_control_window_manager.process_bytes(
+                outstanding,
+            )
+            if conn_increment:
+                f = WindowUpdateFrame(0)
+                f.window_increment = conn_increment
+                self._prepare_for_sending([f])
+            stream._unredeemed_received_bytes = 0
+
+        # Everything outstanding was just returned to the connection window,
+        # so no credential for this stream may be redeemed later.
+        self._settled_credential_streams[stream_id] = None
 
     def data_to_send(self, amount: int | None = None) -> bytes:
         """
@@ -1758,6 +1870,20 @@ class H2Connection:
             # internal state.
             return self._handle_data_on_closed_stream(events, e, frame)
 
+        data_event = next(
+            (event for event in stream_events
+             if isinstance(event, DataReceived)),
+            None,
+        )
+        if data_event is not None and self.config.receive_credentials:
+            credential = ReceiveCredential(
+                connection=self,
+                stream_id=frame.stream_id,
+                flow_controlled_length=flow_controlled_length,
+            )
+            data_event.receive_credential = credential
+            self._credential_streams[frame.stream_id] = None
+
         return frames, events + stream_events
 
     def _receive_settings_frame(self, frame: SettingsFrame) -> tuple[list[Frame], list[Event]]:
@@ -1862,6 +1988,7 @@ class H2Connection:
             stream_events: list[Event] = []
         else:
             stream_frames, stream_events = stream.stream_reset(frame)
+            self._settle_stream_credentials(frame.stream_id)
 
         return stream_frames, events + stream_events
 

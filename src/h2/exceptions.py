@@ -192,3 +192,15 @@ class DenialOfServiceError(ProtocolError):
     #: The error code corresponds to this kind of
     #: :class:`ProtocolError <h2.exceptions.ProtocolError>`
     error_code = ErrorCodes.ENHANCE_YOUR_CALM
+
+
+class ReceiveCredentialError(H2Error):
+    """
+    Emitted when a :class:`ReceiveCredential <h2.receive_credential.ReceiveCredential>`
+    is used incorrectly: for example, when it is redeemed for more
+    flow-controlled bytes than it represents, redeemed on a different
+    :class:`H2Connection <h2.connection.H2Connection>` than the one that issued
+    it, or redeemed again after it has been fully settled.
+
+    .. versionadded:: 4.5.0
+    """

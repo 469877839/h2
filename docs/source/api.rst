@@ -27,6 +27,13 @@ Configuration
    :members:
 
 
+Receive Credentials
+-------------------
+
+.. autoclass:: h2.receive_credential.ReceiveCredential
+   :members:
+
+
 .. _h2-events-api:
 
 Events
@@ -145,6 +152,10 @@ Protocol Errors
    :members:
 
 .. autoclass:: h2.exceptions.DenialOfServiceError
+   :show-inheritance:
+   :members:
+
+.. autoclass:: h2.exceptions.ReceiveCredentialError
    :show-inheritance:
    :members:
 

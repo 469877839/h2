@@ -11,6 +11,17 @@ dev
 **API Changes (Backward Compatible)**
 
 - Support for Python 3.15 has been added.
+- Added an optional receive credential interface, enabled with the new
+  ``H2Configuration(receive_credentials=True)`` flag (off by default). When enabled,
+  ``DataReceived`` events carry a ``receive_credential``: a connection- and stream-bound
+  ``ReceiveCredential`` pre-loaded with the frame's flow-controlled length (padding
+  included) that applications can redeem once via ``complete()`` or in bounded slices via
+  ``partially_complete()`` instead of accumulating bytes for
+  ``acknowledge_received_data``. Over-redemption, cross-connection use and repeat
+  completion raise ``ReceiveCredentialError``. On RST_STREAM the still unredeemed bytes
+  are returned to the connection window only; the stream window is not resurrected.
+  ``acknowledge_received_data`` is preserved but rejected for the lifetime of any stream
+  that has used credentials, so the two accounting styles cannot double-count.
 
 **Bugfixes**
 

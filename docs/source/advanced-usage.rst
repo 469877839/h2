@@ -323,3 +323,77 @@ a certain number of bytes have been freed up.
 
 For most applications, this method should be preferred to the manual flow
 control mechanism.
+
+Receive Credentials
+~~~~~~~~~~~~~~~~~~~
+
+.. versionadded:: 4.5.0
+
+When DATA frames are processed asynchronously it is easy to get the bookkeeping
+wrong: acknowledging the same chunk twice, or forgetting that padding also
+consumes flow control window space. To make this impossible, create the
+connection with :attr:`H2Configuration.receive_credentials
+<h2.config.H2Configuration.receive_credentials>` enabled. Each
+:class:`DataReceived <h2.events.DataReceived>` event then carries an optional
+:class:`ReceiveCredential <h2.receive_credential.ReceiveCredential>` in its
+``receive_credential`` attribute. The credential is pre-loaded with exactly the
+*flow-controlled length* of the frame, padding included, and is bound to the
+connection and stream that received the frame. With the feature disabled (the
+default), ``receive_credential`` is ``None`` and the legacy
+:meth:`acknowledge_received_data
+<h2.connection.H2Connection.acknowledge_received_data>` workflow is unchanged.
+
+Instead of accumulating integers and calling
+:meth:`acknowledge_received_data
+<h2.connection.H2Connection.acknowledge_received_data>`, the application
+redeems the credential once the corresponding bytes have actually been
+processed::
+
+    config = h2.config.H2Configuration(
+        client_side=False, receive_credentials=True,
+    )
+    connection = h2.connection.H2Connection(config=config)
+
+    for event in connection.receive_data(data):
+        if isinstance(event, h2.events.DataReceived):
+            # Redeem the whole frame at once, including any padding.
+            event.receive_credential.complete(connection)
+
+Frames that are consumed in stages can instead redeem bounded slices::
+
+    credential = event.receive_credential
+    while credential.remaining_bytes:
+        chunk = process_some_bytes(event.data)
+        # Only hand back what was really processed.
+        credential.partially_complete(connection, len(chunk))
+
+Redemptions go through the same coalesced, automatic window logic as
+:meth:`acknowledge_received_data
+<h2.connection.H2Connection.acknowledge_received_data>`, so ``WINDOW_UPDATE``
+frames are emitted opportunistically on both the connection (stream ID ``0``)
+and the affected stream.
+
+Credentials enforce their own bounds:
+
+* Redeeming more bytes than remain raises
+  :class:`ReceiveCredentialError <h2.exceptions.ReceiveCredentialError>`.
+* A credential redeemed on a different connection than the one that issued it
+  raises :class:`ReceiveCredentialError <h2.exceptions.ReceiveCredentialError>`.
+* Once a credential is fully redeemed, further calls raise
+  :class:`ReceiveCredentialError <h2.exceptions.ReceiveCredentialError>`, so a
+  duplicated ``complete()`` can never manufacture additional window space.
+* The two accounting styles cannot be mixed: once a stream has been accounted
+  for through credentials, calling :meth:`acknowledge_received_data
+  <h2.connection.H2Connection.acknowledge_received_data>` for that stream raises
+  :class:`ReceiveCredentialError <h2.exceptions.ReceiveCredentialError>` for
+  the lifetime of the stream - even after all its credentials have been
+  redeemed - so the same bytes can never be returned twice.
+
+When a stream is torn down with ``RST_STREAM`` (sent or received), the bytes
+that its outstanding credentials have not yet redeemed are returned to the
+*connection* window only. The stream window is gone and is never resurrected:
+no stream-level ``WINDOW_UPDATE`` is emitted for a reset stream. This keeps the
+rest of the connection flowing without crediting a dead stream.
+
+A zero-length DATA frame (for example one carrying only padding bookkeeping)
+issues a credential that is already complete; it cannot be redeemed.

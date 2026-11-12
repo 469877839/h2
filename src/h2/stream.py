@@ -786,6 +786,11 @@ class H2Stream:
         # The flow control manager.
         self._inbound_window_manager = WindowManager(inbound_window_size)
 
+        # Flow-controlled bytes received on this stream that the application
+        # has not redeemed through a ReceiveCredential yet. Kept even after the
+        # stream closes so that outstanding credentials can still settle.
+        self._unredeemed_received_bytes = 0
+
         # The expected content length, if any.
         self._expected_content_length: int | None = None
 
@@ -1117,6 +1122,7 @@ class H2Stream:
         events = self.state_machine.process_input(StreamInputs.RECV_DATA)
         data_event = cast("DataReceived", events[0])
         self._inbound_window_manager.window_consumed(flow_control_len)
+        self._unredeemed_received_bytes += flow_control_len
         self._track_content_length(len(data), end_stream)
 
         if end_stream:

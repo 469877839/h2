@@ -21,6 +21,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from hyperframe.frame import Frame
 
     from .errors import ErrorCodes
+    from .receive_credential import ReceiveCredential
 
 
 kw_only = {"kw_only": True}
@@ -306,6 +307,26 @@ class DataReceived(Event):
     here.
 
     .. versionadded:: 2.4.0
+    """
+
+    receive_credential: ReceiveCredential | None = None
+    """
+    A :class:`ReceiveCredential <h2.receive_credential.ReceiveCredential>`
+    bound to this connection and stream, pre-loaded with the frame's
+    :attr:`flow_controlled_length` (including padding). Redeem it as the data
+    is processed instead of accumulating flow-controlled bytes yourself.
+
+    Only populated when the connection was created with
+    :attr:`H2Configuration.receive_credentials
+    <h2.config.H2Configuration.receive_credentials>` enabled; otherwise it is
+    ``None``.
+
+    Credentials are mutually exclusive with
+    :meth:`H2Connection.acknowledge_received_data
+    <h2.connection.H2Connection.acknowledge_received_data>`: mixing the two on
+    one receive path counts the same bytes twice.
+
+    .. versionadded:: 4.5.0
     """
 
     def __repr__(self) -> str:
