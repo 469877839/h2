@@ -43,11 +43,13 @@ from .events import (
     RequestReceived,
     ResponseReceived,
     SettingsAcknowledged,
+    StreamReset,
     TrailersReceived,
     UnknownFrameReceived,
     WindowUpdated,
 )
 from .exceptions import (
+    CompressionError,
     DenialOfServiceError,
     FlowControlError,
     FrameTooLargeError,
@@ -1596,19 +1598,32 @@ class H2Connection:
         """
         Receive a headers frame on the connection.
         """
-        # If necessary, check we can open the stream. Also validate that the
-        # stream ID is valid.
-        if frame.stream_id not in self.streams:
-            max_open_streams = self.local_settings.max_concurrent_streams
-            value = self.open_inbound_streams # take a copy due to the property accessor having side affects
-            if (value + 1) > max_open_streams:
-                msg = f"Max inbound streams is {max_open_streams}, {value} open"
-                raise TooManyStreamsError(msg)
-
         # Let's decode the headers. We handle headers as bytes internally up
         # until we hang them off the event, at which point we may optionally
         # convert them to unicode.
+        #
+        # This must happen before any decision to reject the stream: the
+        # HPACK dynamic table is connection-scoped, so the decoder state has
+        # to be updated even for header blocks whose streams we are about to
+        # refuse. Otherwise the connection-level compression context would
+        # desynchronize and all subsequent streams would decode incorrectly.
         headers = _decode_headers(self.decoder, frame.data)
+
+        # If necessary, check we can open the stream. Also validate that the
+        # stream ID is valid. A reused stream ID (one at or below the highest
+        # we have already seen) is not a new stream: skip the concurrency
+        # check and let _get_or_create_stream flag it as a stream error.
+        if (
+            frame.stream_id not in self.streams
+            and frame.stream_id > self.highest_inbound_stream_id
+        ):
+            max_open_streams = self.local_settings.max_concurrent_streams
+            value = self.open_inbound_streams # take a copy due to the property accessor having side affects
+            if (value + 1) > max_open_streams:
+                # Exceeding MAX_CONCURRENT_STREAMS is a stream error, not a
+                # connection error (RFC 9113 § 5.1.2): refuse this stream with
+                # RST_STREAM and keep the connection alive.
+                return self._refuse_stream(frame.stream_id)
 
         events = self.state_machine.process_input(
             ConnectionInputs.RECV_HEADERS,
@@ -1632,6 +1647,36 @@ class H2Connection:
             assert not p_frames
 
         return frames, events + stream_events
+
+    def _refuse_stream(self, stream_id: int) -> tuple[list[Frame], list[Event]]:
+        """
+        Refuse a newly-received stream by resetting it with REFUSED_STREAM.
+
+        Used when the remote peer opens more concurrent streams than we
+        advertised. The stream's header block has already been decoded (so
+        the connection-level HPACK state is intact); all that remains is to
+        keep the stream out of the application and to record it as closed so
+        that any further frames on it are handled as stream errors.
+        """
+        self.state_machine.process_input(ConnectionInputs.RECV_HEADERS)
+
+        f = RstStreamFrame(stream_id)
+        f.error_code = ErrorCodes.REFUSED_STREAM
+
+        # The stream ID is consumed even though the stream was refused: record
+        # it as closed-by-reset so that later frames on it are treated as
+        # stream errors rather than connection errors.
+        self.highest_inbound_stream_id = max(
+            self.highest_inbound_stream_id, stream_id,
+        )
+        self._closed_streams[stream_id] = StreamClosedBy.SEND_RST_STREAM
+
+        event = StreamReset(
+            stream_id=stream_id,
+            error_code=ErrorCodes.REFUSED_STREAM,
+            remote_reset=False,
+        )
+        return [f], [event]
 
     def _receive_push_promise_frame(self, frame: PushPromiseFrame) -> tuple[list[Frame], list[Event]]:
         """
@@ -2113,5 +2158,9 @@ def _decode_headers(decoder: Decoder, encoded_header_block: bytes) -> Iterable[H
         # We should only need HPACKError here, but versions of HPACK older
         # than 2.1.0 throw all three others as well. For maximum
         # compatibility, catch all of them.
+        #
+        # A malformed header block is a connection error of type
+        # COMPRESSION_ERROR (RFC 9113 § 5.4.1), not an ordinary PROTOCOL_ERROR:
+        # the shared HPACK state cannot be trusted afterwards.
         msg = f"Error decoding header block: {e}"
-        raise ProtocolError(msg) from e
+        raise CompressionError(msg) from e

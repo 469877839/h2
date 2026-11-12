@@ -1606,7 +1606,9 @@ class TestBasicServer:
     def test_cannot_receive_new_streams_over_limit(self, frame_factory) -> None:
         """
         When the number of inbound streams exceeds our MAX_CONCURRENT_STREAMS
-        setting, their attempt to open new streams fails.
+        setting, their attempt to open new streams fails with a stream error:
+        the stream is refused with RST_STREAM(REFUSED_STREAM) and the
+        connection stays up.
         """
         c = h2.connection.H2Connection(config=self.server_config)
         c.receive_data(frame_factory.preamble())
@@ -1627,13 +1629,34 @@ class TestBasicServer:
             stream_id=3,
             headers=self.example_request_headers,
         )
-        with pytest.raises(h2.exceptions.TooManyStreamsError):
-            c.receive_data(f.serialize())
+        events = c.receive_data(f.serialize())
 
-        expected_frame = frame_factory.build_goaway_frame(
-            last_stream_id=1, error_code=h2.errors.ErrorCodes.PROTOCOL_ERROR,
+        # The stream is refused: no request is delivered to the application,
+        # but a StreamReset event describes the refusal.
+        assert len(events) == 1
+        event = events[0]
+        assert isinstance(event, h2.events.StreamReset)
+        assert event.stream_id == 3
+        assert event.error_code == h2.errors.ErrorCodes.REFUSED_STREAM
+        assert not event.remote_reset
+
+        expected_frame = frame_factory.build_rst_stream_frame(
+            stream_id=3, error_code=h2.errors.ErrorCodes.REFUSED_STREAM,
         )
         assert c.data_to_send() == expected_frame.serialize()
+
+        # The connection is still usable: once stream 1 closes, a new stream
+        # can be opened.
+        f = frame_factory.build_rst_stream_frame(stream_id=1)
+        c.receive_data(f.serialize())
+        c.clear_outbound_data_buffer()
+
+        f = frame_factory.build_headers_frame(
+            stream_id=5,
+            headers=self.example_request_headers,
+        )
+        events = c.receive_data(f.serialize())
+        assert isinstance(events[0], h2.events.RequestReceived)
 
     def test_can_receive_trailers(self, frame_factory) -> None:
         """

@@ -192,3 +192,17 @@ class DenialOfServiceError(ProtocolError):
     #: The error code corresponds to this kind of
     #: :class:`ProtocolError <h2.exceptions.ProtocolError>`
     error_code = ErrorCodes.ENHANCE_YOUR_CALM
+
+
+class CompressionError(ProtocolError):
+    """
+    Emitted when a received header block cannot be decompressed, for example
+    because it references an invalid HPACK index. This is always a connection
+    error of type COMPRESSION_ERROR (RFC 9113 § 5.4.1): the connection-level
+    HPACK context cannot be recovered, so the whole connection has to be
+    closed.
+    """
+
+    #: The error code corresponds to this kind of
+    #: :class:`ProtocolError <h2.exceptions.ProtocolError>`
+    error_code = ErrorCodes.COMPRESSION_ERROR

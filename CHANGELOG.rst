@@ -7,14 +7,27 @@ dev
 **API Changes (Backward Incompatible)**
 
 - Support for Python 3.10 has been removed.
+- Header blocks that cannot be decompressed now raise
+  ``h2.exceptions.CompressionError`` and close the connection with
+  ``COMPRESSION_ERROR``, instead of raising a generic ``ProtocolError`` with
+  ``PROTOCOL_ERROR``. The new exception is still a subclass of
+  ``ProtocolError``, so code catching ``ProtocolError`` keeps working.
+- Inbound HEADERS exceeding ``MAX_CONCURRENT_STREAMS`` are now refused with a
+  stream-level ``RST_STREAM(REFUSED_STREAM)`` (and a ``StreamReset`` event)
+  instead of tearing the whole connection down with ``GOAWAY`` and
+  ``TooManyStreamsError``. The header block is still decoded first so the
+  connection-level HPACK state stays synchronized.
 
 **API Changes (Backward Compatible)**
 
 - Support for Python 3.15 has been added.
+- Added ``h2.exceptions.CompressionError`` for decompression failures.
 
 **Bugfixes**
 
--
+- HPACK header blocks are now decoded before stream-level rejection, so
+  refused or reset streams still update the connection dynamic table and
+  later streams that reference those entries decode correctly.
 
 4.4.1 (2026-08-03)
 ------------------

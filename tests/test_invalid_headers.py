@@ -936,11 +936,11 @@ class TestOversizedHeaders:
         )
         data = f.serialize()
 
-        with pytest.raises(h2.exceptions.ProtocolError):
+        with pytest.raises(h2.exceptions.CompressionError):
             c.receive_data(data)
 
         expected_frame = frame_factory.build_goaway_frame(
-            last_stream_id=3, error_code=h2.errors.ErrorCodes.PROTOCOL_ERROR,
+            last_stream_id=3, error_code=h2.errors.ErrorCodes.COMPRESSION_ERROR,
         )
         assert c.data_to_send() == expected_frame.serialize()
 
@@ -970,10 +970,10 @@ class TestOversizedHeaders:
         )
         data = f.serialize()
 
-        with pytest.raises(h2.exceptions.ProtocolError):
+        with pytest.raises(h2.exceptions.CompressionError):
             c.receive_data(data)
 
         expected_frame = frame_factory.build_goaway_frame(
-            last_stream_id=1, error_code=h2.errors.ErrorCodes.PROTOCOL_ERROR,
+            last_stream_id=1, error_code=h2.errors.ErrorCodes.COMPRESSION_ERROR,
         )
         assert c.data_to_send() == expected_frame.serialize()

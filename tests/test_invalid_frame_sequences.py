@@ -423,9 +423,10 @@ class TestInvalidFrameSequences:
         assert c.data_to_send() == expected_frame.serialize()
 
     @pytest.mark.parametrize("request_headers", [example_request_headers, example_request_headers_bytes])
-    def test_invalid_header_data_protocol_error(self, frame_factory, request_headers) -> None:
+    def test_invalid_header_data_compression_error(self, frame_factory, request_headers) -> None:
         """
-        If an invalid header block is received, we raise a ProtocolError.
+        If a header block cannot be decoded, we raise a CompressionError and
+        close the connection with COMPRESSION_ERROR.
         """
         c = h2.connection.H2Connection(config=self.server_config)
         c.initiate_connection()
@@ -438,20 +439,20 @@ class TestInvalidFrameSequences:
         )
         f.data = b"\x00\x00\x00\x00"
 
-        with pytest.raises(h2.exceptions.ProtocolError):
+        with pytest.raises(h2.exceptions.CompressionError):
             c.receive_data(f.serialize())
 
         expected_frame = frame_factory.build_goaway_frame(
             last_stream_id=0,
-            error_code=h2.errors.ErrorCodes.PROTOCOL_ERROR,
+            error_code=h2.errors.ErrorCodes.COMPRESSION_ERROR,
         )
         assert c.data_to_send() == expected_frame.serialize()
 
     @pytest.mark.parametrize("request_headers", [example_request_headers, example_request_headers_bytes])
-    def test_invalid_push_promise_data_protocol_error(self, frame_factory, request_headers) -> None:
+    def test_invalid_push_promise_data_compression_error(self, frame_factory, request_headers) -> None:
         """
         If an invalid header block is received on a PUSH_PROMISE, we raise a
-        ProtocolError.
+        CompressionError and close the connection with COMPRESSION_ERROR.
         """
         c = h2.connection.H2Connection()
         c.initiate_connection()
@@ -465,12 +466,12 @@ class TestInvalidFrameSequences:
         )
         f.data = b"\x00\x00\x00\x00"
 
-        with pytest.raises(h2.exceptions.ProtocolError):
+        with pytest.raises(h2.exceptions.CompressionError):
             c.receive_data(f.serialize())
 
         expected_frame = frame_factory.build_goaway_frame(
             last_stream_id=0,
-            error_code=h2.errors.ErrorCodes.PROTOCOL_ERROR,
+            error_code=h2.errors.ErrorCodes.COMPRESSION_ERROR,
         )
         assert c.data_to_send() == expected_frame.serialize()
 

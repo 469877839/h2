@@ -148,6 +148,10 @@ Protocol Errors
    :show-inheritance:
    :members:
 
+.. autoclass:: h2.exceptions.CompressionError
+   :show-inheritance:
+   :members:
+
 
 HTTP/2 Error Codes
 ------------------
