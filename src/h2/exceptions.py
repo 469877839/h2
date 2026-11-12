@@ -61,6 +61,18 @@ class FlowControlError(ProtocolError):
     error_code = ErrorCodes.FLOW_CONTROL_ERROR
 
 
+class QueueFullError(H2Error):
+    """
+    An attempt was made to queue more outbound data than the connection was
+    configured to hold before it can be framed.
+
+    The data that did not fit is not accepted: it remains the caller's
+    responsibility and can be retried later or discarded.
+
+    .. versionadded:: 4.5.0
+    """
+
+
 class StreamIDTooLowError(ProtocolError):
     """
     An attempt was made to open a stream that had an ID that is lower than the

@@ -323,3 +323,60 @@ a certain number of bytes have been freed up.
 
 For most applications, this method should be preferred to the manual flow
 control mechanism.
+
+Outbound Data Queue
+~~~~~~~~~~~~~~~~~~~
+
+.. versionadded:: 4.5.0
+
+Normally h2 does not buffer outbound ``DATA``: :meth:`send_data
+<h2.connection.H2Connection.send_data>` refuses payloads that do not fit in
+the current flow control window, leaving every caller to implement the same
+"store the payload and retry when a ``WINDOW_UPDATE`` arrives" logic. The
+optional outbound data queue moves that logic into the connection itself.
+
+Construct the connection with a queue limit (or leave it unbounded) and use
+:meth:`queue_data <h2.connection.H2Connection.queue_data>` instead of
+:meth:`send_data <h2.connection.H2Connection.send_data>` for payloads that may
+exhaust a window::
+
+    c = h2.connection.H2Connection(max_queued_data=1_048_576)
+    accepted = c.queue_data(stream_id, payload, end_stream=True)
+
+``queue_data`` never raises :class:`FlowControlError
+<h2.exceptions.FlowControlError>`: data that does not fit is kept inside the
+connection and split into frames when the window is restored, for example when
+a ``WINDOW_UPDATE`` frame arrives or a ``SETTINGS`` frame grows
+``INITIAL_WINDOW_SIZE``. Every emitted frame still respects the connection
+window, the stream window and the peer's ``MAX_FRAME_SIZE``. ``send_data``
+itself is unchanged and continues to send immediately, so existing code keeps
+its current behavior.
+
+The integer returned by ``queue_data`` is the number of bytes the protocol
+layer accepted. When a configured queue limit leaves no room for the whole
+payload, only the fitting prefix is accepted; if there is no room at all
+:class:`QueueFullError <h2.exceptions.QueueFullError>` is raised and nothing
+is accepted. Bytes that have not yet been framed remain cancellable with
+:meth:`cancel_queued_data <h2.connection.H2Connection.cancel_queued_data>`,
+which returns the withdrawn payload and whether a queued ``END_STREAM`` marker
+was withdrawn. :meth:`pending_queued_data
+<h2.connection.H2Connection.pending_queued_data>` reports how many accepted
+bytes are still waiting.
+
+Queued data is scheduled with an explicit byte rotation between streams: each
+stream with pending data is served once per flush pass and then moved to the
+back of the queue, no matter how large its backlog is. A stream that cannot
+make progress because its window (or the connection window) is exhausted is
+marked blocked and skipped, so other streams still get their turn. This makes
+it impossible for a single large body to starve the other streams while
+remaining deterministic - there are no timing or throughput assumptions
+involved.
+
+``END_STREAM`` is attached to the final queued ``DATA`` frame whenever
+possible; if :meth:`end_stream <h2.connection.H2Connection.end_stream>` is
+called while data is queued, an empty ``DATA`` frame carrying the flag is
+emitted once the backlog drains. Control frames are never queued: they are
+serialized ahead of queued data, so a large body cannot delay ``SETTINGS``
+acknowledgements, ``PING`` acks, ``RST_STREAM`` frames or other control
+traffic. Resetting a stream or tearing down the connection with ``GOAWAY``
+discards everything still queued for the affected streams.

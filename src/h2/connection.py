@@ -54,14 +54,16 @@ from .exceptions import (
     NoAvailableStreamIDError,
     NoSuchStreamError,
     ProtocolError,
+    QueueFullError,
     RFC1122Error,
     StreamClosedError,
     StreamIDTooLowError,
     TooManyStreamsError,
 )
 from .frame_buffer import FrameBuffer
+from .send_queue import SendQueue
 from .settings import ChangedSetting, SettingCodes, Settings
-from .stream import H2Stream, StreamClosedBy
+from .stream import H2Stream, StreamClosedBy, StreamState
 from .utilities import SizeLimitDict, guard_increment_window
 from .windows import WindowManager
 
@@ -295,11 +297,20 @@ class H2Connection:
     .. versionchanged:: 3.0.0
        Removed deprecated parameters and properties.
 
+    .. versionchanged:: 4.5.0
+       Added the ``max_queued_data`` keyword argument.
+
     :param config: The configuration for the HTTP/2 connection.
 
         .. versionadded:: 2.5.0
 
     :type config: :class:`H2Configuration <h2.config.H2Configuration>`
+
+    :param max_queued_data: (optional) The maximum number of pending bytes the
+        optional outbound data queue (see :meth:`queue_data
+        <h2.connection.H2Connection.queue_data>`) may keep across all streams.
+        Defaults to ``None``, meaning the queue is unbounded.
+    :type max_queued_data: ``int`` or ``None``
     """
 
     # The initial maximum outbound frame size. This can be changed by receiving
@@ -322,7 +333,14 @@ class H2Connection:
     # Keep in memory limited amount of results for streams closes
     MAX_CLOSED_STREAMS = 2**16
 
-    def __init__(self, config: H2Configuration | None = None) -> None:
+    def __init__(self,
+                 config: H2Configuration | None = None,
+                 *,
+                 max_queued_data: int | None = None) -> None:
+        if max_queued_data is not None and max_queued_data < 0:
+            msg = "max_queued_data must be non-negative"
+            raise ValueError(msg)
+
         self.state_machine = H2ConnectionStateMachine()
         self.streams: dict[int, H2Stream] = {}
         self.highest_inbound_stream_id = 0
@@ -385,6 +403,12 @@ class H2Connection:
 
         # Data that needs to be sent.
         self._data_to_send = bytearray()
+
+        # The optional outbound data queue. Data queued with
+        # :meth:`queue_data` waits here until flow control windows and frame
+        # size limits allow it to be framed. Bytes in this queue have not been
+        # handed to the protocol layer and can still be cancelled.
+        self._send_queue = SendQueue(max_size=max_queued_data)
 
         # Keeps track of how streams are closed.
         # Used to ensure that we don't blow up in the face of frames that were
@@ -911,12 +935,240 @@ class H2Connection:
         )
         assert self.outbound_flow_control_window >= 0 or frame_size == 0
 
+    def queue_data(self,
+                   stream_id: int,
+                   data: bytes | memoryview,
+                   end_stream: bool = False) -> int:
+        """
+        Queue data for a stream, to be sent later as flow control windows
+        allow.
+
+        Unlike :meth:`send_data <h2.connection.H2Connection.send_data>`, this
+        never raises :class:`FlowControlError <h2.exceptions.FlowControlError>`
+        when a window is exhausted: data that cannot be put on the wire yet is
+        retained by the connection and split into frames when the window is
+        restored, for example on receipt of a ``WINDOW_UPDATE`` frame. Queued
+        data is scheduled fairly between streams using an explicit byte
+        rotation: each stream is served once per pass and then moved to the
+        back of the queue, so a large body cannot starve the other streams.
+
+        Every emitted ``DATA`` frame respects the connection flow control
+        window, the stream flow control window and the peer's
+        ``SETTINGS_MAX_FRAME_SIZE``. Control frames are never queued, so a
+        backlog of body data cannot delay them.
+
+        The returned integer is the number of bytes accepted from ``data``.
+        Accepted bytes belong to the protocol layer (though anything not yet
+        framed remains cancellable via
+        :meth:`cancel_queued_data <h2.connection.H2Connection.cancel_queued_data>`);
+        the remaining bytes stay with the caller and may be retried. An empty
+        payload with ``end_stream`` set is always accepted and returns ``0``.
+
+        If a queue size limit was configured with ``max_queued_data``, the
+        queue accepts only as much of ``data`` as fits and the returned count
+        reflects that; bytes that did not fit remain the caller's. If the
+        queue has no room at all, :class:`QueueFullError
+        <h2.exceptions.QueueFullError>` is raised and nothing is accepted.
+
+        .. versionadded:: 4.5.0
+
+        :param stream_id: The ID of the stream on which to send the data.
+        :type stream_id: ``int``
+        :param data: The data to send on the stream.
+        :type data: ``bytes`` or ``memoryview``
+        :param end_stream: (optional) Whether this is the last data to be sent
+            on the stream. Defaults to ``False``.
+        :type end_stream: ``bool``
+        :returns: The number of bytes from ``data`` that were accepted.
+        :rtype: ``int``
+        :raises QueueFullError: If the configured queue limit is full.
+        :raises NoSuchStreamError: If the stream ID does not correspond to a
+            known stream.
+        :raises StreamClosedError: If the stream has been closed.
+        """
+        self.config.logger.debug(
+            "Queue data on stream ID %d with len %d", stream_id, len(data),
+        )
+        stream = self._get_stream_by_id(stream_id)
+        # Validate the stream state exactly as an immediate send would. A
+        # CLOSED stream raises StreamClosedError; a stream that has already
+        # sent END_STREAM (HALF_CLOSED_LOCAL) cannot accept further DATA.
+        if not stream.open:
+            raise StreamClosedError(stream_id)
+        if stream.state_machine.state == StreamState.HALF_CLOSED_LOCAL:
+            msg = f"Cannot queue data on stream {stream_id}: END_STREAM was already sent"
+            raise ProtocolError(msg)
+        if data and self._send_queue.pending_end_stream(stream_id):
+            msg = "Cannot queue data after END_STREAM has been queued"
+            raise ProtocolError(msg)
+
+        length = len(data)
+        max_size = self._send_queue.max_size
+        if length and max_size is not None and not self._send_queue.can_accept(length):
+            room = max_size - self._send_queue.total_pending
+            if room <= 0:
+                # No room at all: make the failure explicit rather than
+                # silently accepting nothing.
+                msg = (
+                    f"Outbound data queue is full: "
+                    f"{self._send_queue.total_pending} of {max_size} bytes in use"
+                )
+                raise QueueFullError(msg)
+
+        # When the queue can only take part of the payload, the END_STREAM
+        # marker must stay with the caller too: closing the stream while some
+        # of its body was rejected would truncate the body.
+        accept_end_stream = end_stream and self._send_queue.can_accept(length)
+        accepted = self._send_queue.enqueue(
+            stream_id, data, end_stream=accept_end_stream,
+        )
+        self.config.logger.debug(
+            "Queued %d of %d bytes on stream ID %d", accepted, length, stream_id,
+        )
+        self._flush_queued_data()
+        return accepted
+
+    def flush_queued_data(self) -> int:
+        """
+        Emit as many queued ``DATA`` frames as the current flow control
+        windows and frame size limits allow.
+
+        This is normally invoked automatically after data is queued and
+        whenever a received frame opens a window, so explicit calls are rarely
+        needed. It is useful after manipulating window state directly in
+        tests.
+
+        .. versionadded:: 4.5.0
+
+        :returns: The number of queued bytes turned into frames.
+        :rtype: ``int``
+        """
+        return self._flush_queued_data()
+
+    def pending_queued_data(self, stream_id: int | None = None) -> int:
+        """
+        The number of accepted bytes that are still waiting to be framed.
+
+        These bytes have been handed to the protocol layer via
+        :meth:`queue_data <h2.connection.H2Connection.queue_data>` but no
+        ``DATA`` frame has been produced for them yet, so they can still be
+        withdrawn with :meth:`cancel_queued_data
+        <h2.connection.H2Connection.cancel_queued_data>`.
+
+        .. versionadded:: 4.5.0
+
+        :param stream_id: (optional) The stream to inspect. When omitted, the
+            total across all queued streams is returned.
+        :type stream_id: ``int`` or ``None``
+        :returns: The number of pending bytes.
+        :rtype: ``int``
+        """
+        if stream_id is None:
+            return self._send_queue.total_pending
+        return self._send_queue.pending(stream_id)
+
+    def cancel_queued_data(self, stream_id: int) -> tuple[bytes, bool]:
+        """
+        Withdraw and return everything still queued for a stream.
+
+        Only data that has not yet been framed can be withdrawn: bytes already
+        serialized into the outbound buffer or put on the wire are gone. The
+        returned tuple is ``(data, end_stream)``, where ``data`` is the
+        complete pending payload in order and ``end_stream`` says whether a
+        queued ``END_STREAM`` marker was also withdrawn. ``(b"", False)`` is
+        returned when nothing is queued.
+
+        This does not close the stream; callers remain free to
+        :meth:`reset_stream <h2.connection.H2Connection.reset_stream>` it.
+
+        .. versionadded:: 4.5.0
+
+        :param stream_id: The ID of the stream whose queue should be drained.
+        :type stream_id: ``int``
+        :returns: A tuple of the withdrawn payload and ``END_STREAM`` flag.
+        :rtype: ``tuple`` of (``bytes``, ``bool``)
+        """
+        data, end_stream = self._send_queue.cancel(stream_id)
+        self.config.logger.debug(
+            "Cancelled %d queued bytes on stream ID %d (end_stream=%s)",
+            len(data), stream_id, end_stream,
+        )
+        return data, end_stream
+
+    def _flush_queued_data(self) -> int:
+        """
+        Drain the outbound data queue into the serialized send buffer.
+
+        One flush pass gives every unblocked stream a single turn, in the
+        queue's byte-rotation order. On each turn at most one frame is built;
+        its size is the minimum of the connection window, the stream window
+        and the maximum outbound frame size. A stream that cannot make
+        progress is marked blocked so the other streams still get their turn.
+        """
+        queue = self._send_queue
+        if not queue.total_pending and not queue.stream_ids:
+            return 0
+
+        queue.reset_blocked()
+        framed = 0
+
+        while True:
+            stream_id = queue.select()
+            if stream_id is None:
+                break
+
+            stream = self.streams[stream_id]
+            run = queue.next_run(stream_id)
+
+            if not run.data and run.end_stream:
+                # A bare END_STREAM frame, reachable only once every queued
+                # payload for the stream has already been framed.
+                queue.emit_empty_end_stream(stream_id)
+                self.state_machine.process_input(ConnectionInputs.SEND_DATA)
+                frames = stream.end_stream()
+                self._prepare_for_sending(frames)
+                queue.complete_turn(stream_id)
+                continue
+
+            chunk_size = min(
+                len(run.data),
+                self.outbound_flow_control_window,
+                stream.outbound_flow_control_window,
+                self.max_outbound_frame_size,
+            )
+            if chunk_size <= 0:
+                queue.mark_blocked(stream_id)
+                continue
+
+            emitted = queue.consume(stream_id, chunk_size)
+            # Partial frames never carry END_STREAM: the flag stays on the
+            # remaining payload until the whole run goes out, at which point
+            # it is attached to the final payload frame.
+            end_stream = emitted.end_stream
+            self.state_machine.process_input(ConnectionInputs.SEND_DATA)
+            frames = stream.send_data(emitted.data, end_stream=end_stream)
+            self._prepare_for_sending(frames)
+            framed += chunk_size
+            self.outbound_flow_control_window -= chunk_size
+            self.config.logger.debug(
+                "Flushed %d queued bytes on stream ID %d (end_stream=%s)",
+                chunk_size, stream_id, end_stream,
+            )
+
+            queue.complete_turn(stream_id)
+
+        return framed
+
     def end_stream(self, stream_id: int) -> None:
         """
         Cleanly end a given stream.
 
         This method ends a stream by sending an empty DATA frame on that stream
-        with the ``END_STREAM`` flag set.
+        with the ``END_STREAM`` flag set. If data for the stream is waiting in
+        the outbound queue (see :meth:`queue_data
+        <h2.connection.H2Connection.queue_data>`), the flag is instead attached
+        to the final queued frame and the empty frame is emitted once the
+        queue drains.
 
         :param stream_id: The ID of the stream to end.
         :type stream_id: ``int``
@@ -927,6 +1179,11 @@ class H2Connection:
             that has been closed.
         """
         self.config.logger.debug("End stream ID %d", stream_id)
+        if self._send_queue.pending(stream_id) or self._send_queue.pending_end_stream(stream_id):
+            self._send_queue.enqueue(stream_id, b"", end_stream=True)
+            self._flush_queued_data()
+            return
+
         self.state_machine.process_input(ConnectionInputs.SEND_DATA)
         frames = self._get_stream_by_id(stream_id).end_stream()
         self._prepare_for_sending(frames)
@@ -1073,6 +1330,8 @@ class H2Connection:
         self.state_machine.process_input(ConnectionInputs.SEND_RST_STREAM)
         stream = self._get_stream_by_id(stream_id)
         frames = stream.reset_stream(error_code)
+        # The stream is gone: any data still queued for it can never be sent.
+        self._send_queue.cancel(stream_id)
         self._prepare_for_sending(frames)
 
     def close_connection(self,
@@ -1109,6 +1368,8 @@ class H2Connection:
             error_code=error_code,
             additional_data=(additional_data or b""),
         )
+        # No further DATA may be sent after a GOAWAY.
+        self._send_queue.clear()
         self._prepare_for_sending([f])
 
     def update_settings(self, new_settings: dict[SettingCodes | int, int]) -> None:
@@ -1579,6 +1840,10 @@ class H2Connection:
         else:
             self._prepare_for_sending(frames)
 
+        # Control frames emitted by the dispatch above are already in the
+        # buffer. Queued DATA is only drained afterwards, so a large body can
+        # never delay a SETTINGS ACK, WINDOW_UPDATE, PING ACK or RST_STREAM.
+        self._flush_queued_data()
         return events
 
     def _terminate_connection(self, error_code: ErrorCodes) -> None:
@@ -1863,6 +2128,8 @@ class H2Connection:
         else:
             stream_frames, stream_events = stream.stream_reset(frame)
 
+        # A reset stream can never carry its queued data: drop it.
+        self._send_queue.cancel(frame.stream_id)
         return stream_frames, events + stream_events
 
     def _receive_priority_frame(self, frame: HeadersFrame | PriorityFrame) -> tuple[list[Frame], list[Event]]:
@@ -1900,6 +2167,7 @@ class H2Connection:
 
         # Clear the outbound data buffer: we cannot send further data now.
         self.clear_outbound_data_buffer()
+        self._send_queue.clear()
 
         # Fire an appropriate ConnectionTerminated event.
         new_event = ConnectionTerminated()

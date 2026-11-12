@@ -11,6 +11,16 @@ dev
 **API Changes (Backward Compatible)**
 
 - Support for Python 3.15 has been added.
+- Added an optional flow-control-aware outbound data queue.
+  ``H2Connection`` now accepts a ``max_queued_data`` keyword argument, and the
+  new ``queue_data``, ``flush_queued_data``, ``pending_queued_data`` and
+  ``cancel_queued_data`` methods allow callers to hand payloads to the
+  protocol layer before a flow control window has room. The connection splits
+  queued data into frames once windows reopen, using an explicit byte-fair
+  rotation between streams while respecting the connection window, stream
+  windows and ``SETTINGS_MAX_FRAME_SIZE``. ``send_data`` keeps its existing
+  immediate-send semantics. The new ``QueueFullError`` exception signals that
+  a configured queue limit has no room.
 
 **Bugfixes**
 

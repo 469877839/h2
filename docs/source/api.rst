@@ -126,6 +126,10 @@ Protocol Errors
    :show-inheritance:
    :members:
 
+.. autoclass:: h2.exceptions.QueueFullError
+   :show-inheritance:
+   :members:
+
 .. autoclass:: h2.exceptions.StreamIDTooLowError
    :show-inheritance:
    :members:
