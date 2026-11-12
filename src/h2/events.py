@@ -562,8 +562,26 @@ class PriorityUpdated(Event):
 class ConnectionTerminated(Event):
     """
     The ConnectionTerminated event is fired when a connection is torn down by
-    the remote peer using a GOAWAY frame. Once received, no further action may
+    the remote peer using a GOAWAY frame.
+
+    If the GOAWAY frame carried a non-zero error code, no further action may
     be taken on the connection: a new connection must be established.
+
+    If the GOAWAY frame carried the error code ``NO_ERROR`` (that is, the
+    remote peer is gracefully shutting down), the connection enters a
+    draining state instead: streams the remote peer has already accepted
+    (those with stream IDs less than or equal to ``last_stream_id``) may
+    continue to completion, while streams with higher stream IDs were never
+    processed by the remote peer and may be safely retried on a new
+    connection. In this case the event's :attr:`graceful` attribute is
+    ``True`` and one :class:`StreamRetryable <h2.events.StreamRetryable>`
+    event is emitted for each stream that was not accepted by the remote
+    peer.
+
+    .. versionchanged:: 4.5.0
+       Added the ``graceful`` attribute. Graceful GOAWAY frames (those with
+       error code ``NO_ERROR``) no longer unconditionally tear down the
+       connection.
     """
 
     def __init__(self) -> None:
@@ -580,6 +598,13 @@ class ConnectionTerminated(Event):
         #: Additional debug data that can be appended to GOAWAY frame.
         self.additional_data: bytes | None = None
 
+        #: Whether this GOAWAY frame indicates a graceful shutdown (error
+        #: code ``NO_ERROR``) rather than an error teardown. When ``True``,
+        #: the connection is draining: accepted streams may still complete.
+        #:
+        #: .. versionadded:: 4.5.0
+        self.graceful: bool = False
+
     def __repr__(self) -> str:
         return (
             "<ConnectionTerminated error_code:{!s}, last_stream_id:{}, "
@@ -590,6 +615,37 @@ class ConnectionTerminated(Event):
                     self.additional_data[:20]
                     if self.additional_data else None),
             )
+        )
+
+
+class StreamRetryable(Event):
+    """
+    The StreamRetryable event is fired when a graceful GOAWAY frame from the
+    remote peer indicates that a stream this peer initiated was never
+    processed: its stream ID is higher than the ``last_stream_id`` of the
+    GOAWAY frame.
+
+    Because the remote peer never took any action on the stream, the request
+    (or pushed response) associated with it may be safely retried on a new
+    connection. h2 does not replay anything automatically: this event simply
+    provides the reliable signal the application needs to decide what to
+    retry.
+
+    .. versionadded:: 4.5.0
+    """
+
+    def __init__(self) -> None:
+        #: The ID of the stream that was not processed by the remote peer.
+        self.stream_id: int | None = None
+
+        #: The ``last_stream_id`` of the GOAWAY frame that caused this
+        #: stream to become retryable.
+        self.last_stream_id: int | None = None
+
+    def __repr__(self) -> str:
+        return (
+            f"<StreamRetryable stream_id:{self.stream_id}, "
+            f"last_stream_id:{self.last_stream_id}>"
         )
 
 

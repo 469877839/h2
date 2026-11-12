@@ -11,6 +11,18 @@ dev
 **API Changes (Backward Compatible)**
 
 - Support for Python 3.15 has been added.
+- Add an explicit graceful shutdown flow for NO_ERROR GOAWAY frames. Instead
+  of treating every GOAWAY as a connection teardown, the connection now enters
+  a draining state (``ConnectionState.LOCAL_CLOSING`` /
+  ``ConnectionState.REMOTE_CLOSING``) in which streams already accepted by the
+  peer continue to completion, DATA/WINDOW_UPDATE/RST_STREAM for those streams
+  keep being processed, new streams are rejected, and streams the remote peer
+  never accepted are reported via new ``StreamRetryable`` events and the
+  ``retryable_stream_ids`` property. ``ConnectionTerminated`` gains a
+  ``graceful`` flag, and the new ``closing``, ``local_last_stream_id`` and
+  ``remote_last_stream_id`` properties expose the shutdown state. GOAWAY
+  frames with a non-zero error code continue to fail fast. h2 never replays
+  application requests itself.
 
 **Bugfixes**
 

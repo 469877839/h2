@@ -43,6 +43,7 @@ from .events import (
     RequestReceived,
     ResponseReceived,
     SettingsAcknowledged,
+    StreamRetryable,
     TrailersReceived,
     UnknownFrameReceived,
     WindowUpdated,
@@ -61,7 +62,7 @@ from .exceptions import (
 )
 from .frame_buffer import FrameBuffer
 from .settings import ChangedSetting, SettingCodes, Settings
-from .stream import H2Stream, StreamClosedBy
+from .stream import H2Stream, StreamClosedBy, StreamInputs
 from .utilities import SizeLimitDict, guard_increment_window
 from .windows import WindowManager
 
@@ -78,6 +79,15 @@ class ConnectionState(Enum):
     CLIENT_OPEN = 1
     SERVER_OPEN = 2
     CLOSED = 3
+    # This peer has sent a graceful (NO_ERROR) GOAWAY. Frames for streams that
+    # this peer has already accepted are still handled, but no new inbound
+    # streams are accepted and no new outbound streams are initiated.
+    LOCAL_CLOSING = 4
+    # This peer has received a graceful (NO_ERROR) GOAWAY. Frames for streams
+    # the remote peer has already accepted (stream IDs at or below the
+    # GOAWAY's last_stream_id) are still handled, but no new outbound streams
+    # are initiated and unaccepted streams become retryable.
+    REMOTE_CLOSING = 5
 
 
 class ConnectionInputs(Enum):
@@ -147,9 +157,9 @@ class H2ConnectionStateMachine:
         (ConnectionState.IDLE, ConnectionInputs.RECV_PING):
             (None, ConnectionState.IDLE),
         (ConnectionState.IDLE, ConnectionInputs.SEND_GOAWAY):
-            (None, ConnectionState.CLOSED),
+            (None, ConnectionState.LOCAL_CLOSING),
         (ConnectionState.IDLE, ConnectionInputs.RECV_GOAWAY):
-            (None, ConnectionState.CLOSED),
+            (None, ConnectionState.REMOTE_CLOSING),
         (ConnectionState.IDLE, ConnectionInputs.SEND_PRIORITY):
             (None, ConnectionState.IDLE),
         (ConnectionState.IDLE, ConnectionInputs.RECV_PRIORITY):
@@ -165,7 +175,7 @@ class H2ConnectionStateMachine:
         (ConnectionState.CLIENT_OPEN, ConnectionInputs.SEND_DATA):
             (None, ConnectionState.CLIENT_OPEN),
         (ConnectionState.CLIENT_OPEN, ConnectionInputs.SEND_GOAWAY):
-            (None, ConnectionState.CLOSED),
+            (None, ConnectionState.LOCAL_CLOSING),
         (ConnectionState.CLIENT_OPEN, ConnectionInputs.SEND_WINDOW_UPDATE):
             (None, ConnectionState.CLIENT_OPEN),
         (ConnectionState.CLIENT_OPEN, ConnectionInputs.SEND_PING):
@@ -181,7 +191,7 @@ class H2ConnectionStateMachine:
         (ConnectionState.CLIENT_OPEN, ConnectionInputs.RECV_DATA):
             (None, ConnectionState.CLIENT_OPEN),
         (ConnectionState.CLIENT_OPEN, ConnectionInputs.RECV_GOAWAY):
-            (None, ConnectionState.CLOSED),
+            (None, ConnectionState.REMOTE_CLOSING),
         (ConnectionState.CLIENT_OPEN, ConnectionInputs.RECV_WINDOW_UPDATE):
             (None, ConnectionState.CLIENT_OPEN),
         (ConnectionState.CLIENT_OPEN, ConnectionInputs.RECV_PING):
@@ -206,7 +216,7 @@ class H2ConnectionStateMachine:
         (ConnectionState.SERVER_OPEN, ConnectionInputs.SEND_DATA):
             (None, ConnectionState.SERVER_OPEN),
         (ConnectionState.SERVER_OPEN, ConnectionInputs.SEND_GOAWAY):
-            (None, ConnectionState.CLOSED),
+            (None, ConnectionState.LOCAL_CLOSING),
         (ConnectionState.SERVER_OPEN, ConnectionInputs.SEND_WINDOW_UPDATE):
             (None, ConnectionState.SERVER_OPEN),
         (ConnectionState.SERVER_OPEN, ConnectionInputs.SEND_PING):
@@ -220,7 +230,7 @@ class H2ConnectionStateMachine:
         (ConnectionState.SERVER_OPEN, ConnectionInputs.RECV_DATA):
             (None, ConnectionState.SERVER_OPEN),
         (ConnectionState.SERVER_OPEN, ConnectionInputs.RECV_GOAWAY):
-            (None, ConnectionState.CLOSED),
+            (None, ConnectionState.REMOTE_CLOSING),
         (ConnectionState.SERVER_OPEN, ConnectionInputs.RECV_WINDOW_UPDATE):
             (None, ConnectionState.SERVER_OPEN),
         (ConnectionState.SERVER_OPEN, ConnectionInputs.RECV_PING):
@@ -246,6 +256,42 @@ class H2ConnectionStateMachine:
         (ConnectionState.CLOSED, ConnectionInputs.RECV_GOAWAY):
             (None, ConnectionState.CLOSED),
     }
+
+    # During a graceful shutdown (either peer may have sent a NO_ERROR GOAWAY
+    # frame) the connection drains: all frames that were legal while the
+    # connection was open remain legal so that in-flight streams can finish.
+    # Restrictions that graceful shutdown imposes (no new streams, no pushes
+    # past the GOAWAY boundary) are enforced by H2Connection, which has the
+    # stream-level context the state machine lacks.
+    _closing_inputs = (
+        ConnectionInputs.SEND_HEADERS,
+        ConnectionInputs.SEND_PUSH_PROMISE,
+        ConnectionInputs.SEND_DATA,
+        ConnectionInputs.SEND_GOAWAY,
+        ConnectionInputs.SEND_WINDOW_UPDATE,
+        ConnectionInputs.SEND_PING,
+        ConnectionInputs.SEND_SETTINGS,
+        ConnectionInputs.SEND_RST_STREAM,
+        ConnectionInputs.SEND_PRIORITY,
+        ConnectionInputs.RECV_HEADERS,
+        ConnectionInputs.RECV_PUSH_PROMISE,
+        ConnectionInputs.RECV_DATA,
+        ConnectionInputs.RECV_GOAWAY,
+        ConnectionInputs.RECV_WINDOW_UPDATE,
+        ConnectionInputs.RECV_PING,
+        ConnectionInputs.RECV_SETTINGS,
+        ConnectionInputs.RECV_RST_STREAM,
+        ConnectionInputs.RECV_PRIORITY,
+        ConnectionInputs.SEND_ALTERNATIVE_SERVICE,
+        ConnectionInputs.RECV_ALTERNATIVE_SERVICE,
+    )
+    for _closing_state in (ConnectionState.LOCAL_CLOSING,
+                           ConnectionState.REMOTE_CLOSING):
+        for _closing_input in _closing_inputs:
+            _transitions[(_closing_state, _closing_input)] = (
+                None, _closing_state,
+            )
+    del _closing_inputs, _closing_state, _closing_input
 
     def __init__(self) -> None:
         self.state = ConnectionState.IDLE
@@ -396,6 +442,18 @@ class H2Connection:
             size_limit=self.MAX_CLOSED_STREAMS,
         )
 
+        # Graceful shutdown bookkeeping. These track the last_stream_id of
+        # the most recent graceful GOAWAY frame sent by us or received from
+        # the remote peer, respectively. ``None`` means no graceful GOAWAY
+        # has been sent/received in that direction yet.
+        self._local_last_stream_id: int | None = None
+        self._remote_last_stream_id: int | None = None
+
+        # IDs of locally-initiated streams that the remote peer has told us
+        # (via a graceful GOAWAY) it never processed. These streams may be
+        # safely retried on a new connection: h2 does not retry them itself.
+        self._retryable_stream_ids: set[int] = set()
+
         # The flow control window manager for the connection.
         self._inbound_flow_control_window_manager = WindowManager(
             max_window_size=self.local_settings.initial_window_size,
@@ -459,6 +517,64 @@ class H2Connection:
         """
         inbound_numbers = int(not self.config.client_side)
         return self._open_streams(inbound_numbers)
+
+    @property
+    def closing(self) -> bool:
+        """
+        Whether the connection is in the process of shutting down gracefully.
+
+        This is ``True`` when either this peer has sent a graceful GOAWAY
+        frame, or the remote peer has sent one. In that state existing
+        streams that the relevant peer accepted may still make progress,
+        but no new streams should be created.
+
+        .. versionadded:: 4.5.0
+        """
+        return self.state_machine.state in (
+            ConnectionState.LOCAL_CLOSING,
+            ConnectionState.REMOTE_CLOSING,
+        )
+
+    @property
+    def local_last_stream_id(self) -> int | None:
+        """
+        The ``last_stream_id`` of the most recent graceful GOAWAY frame this
+        peer has sent, or ``None`` if no graceful shutdown has been initiated
+        locally. This is the highest inbound stream ID this peer promises to
+        process; lower-numbered streams that are still open may complete.
+
+        .. versionadded:: 4.5.0
+        """
+        return self._local_last_stream_id
+
+    @property
+    def remote_last_stream_id(self) -> int | None:
+        """
+        The ``last_stream_id`` of the most recent graceful GOAWAY frame
+        received from the remote peer, or ``None`` if the remote peer has not
+        initiated a graceful shutdown. This is the highest outbound stream ID
+        the remote peer accepted; higher-numbered streams were never
+        processed and are reported as retryable.
+
+        .. versionadded:: 4.5.0
+        """
+        return self._remote_last_stream_id
+
+    @property
+    def retryable_stream_ids(self) -> frozenset[int]:
+        """
+        The set of stream IDs that the remote peer has explicitly told us
+        (via a graceful GOAWAY frame) it never accepted, and which may
+        therefore be safely retried on a new connection.
+
+        h2 never replays application requests itself: this property (and the
+        :class:`StreamRetryable <h2.events.StreamRetryable>` events) give the
+        application the reliable information it needs to decide what to
+        retry.
+
+        .. versionadded:: 4.5.0
+        """
+        return frozenset(self._retryable_stream_ids)
 
     @property
     def inbound_flow_control_window(self) -> int:
@@ -794,6 +910,12 @@ class H2Connection:
 
         # Check we can open the stream.
         if stream_id not in self.streams:
+            if self.closing:
+                msg = (
+                    "Cannot initiate new streams while the connection is "
+                    "shutting down"
+                )
+                raise ProtocolError(msg)
             max_open_streams = self.remote_settings.max_concurrent_streams
             value = self.open_outbound_streams # take a copy due to the property accessor having side affects
             if (value + 1) > max_open_streams:
@@ -1010,6 +1132,13 @@ class H2Connection:
             msg = "Remote peer has disabled stream push"
             raise ProtocolError(msg)
 
+        if self.closing:
+            msg = (
+                "Cannot initiate pushed streams while the connection is "
+                "shutting down"
+            )
+            raise ProtocolError(msg)
+
         self.state_machine.process_input(ConnectionInputs.SEND_PUSH_PROMISE)
         stream = self._get_stream_by_id(stream_id)
 
@@ -1082,8 +1211,28 @@ class H2Connection:
         """
         Close a connection, emitting a GOAWAY frame.
 
+        When called with the default error code of :data:`ErrorCodes.NO_ERROR
+        <h2.errors.ErrorCodes.NO_ERROR>` this initiates a *graceful* shutdown:
+        the connection enters the
+        :attr:`ConnectionState.LOCAL_CLOSING
+        <h2.connection.ConnectionState.LOCAL_CLOSING>` state, where inbound
+        streams up to and including ``last_stream_id`` may continue to be
+        processed to completion, but new inbound streams are rejected and no
+        new outbound streams are initiated. A second, later call may lower
+        ``last_stream_id`` as in-flight streams finish.
+
+        When called with any other error code the connection is torn down
+        immediately, as previously: the state machine moves to
+        :attr:`ConnectionState.CLOSED
+        <h2.connection.ConnectionState.CLOSED>` and no further frames can be
+        exchanged.
+
         .. versionchanged:: 2.4.0
            Added ``additional_data`` and ``last_stream_id`` arguments.
+
+        .. versionchanged:: 4.5.0
+           A NO_ERROR GOAWAY no longer tears down the connection: it enters
+           the graceful draining state instead.
 
         :param error_code: (optional) The error code to send in the GOAWAY
             frame.
@@ -1094,6 +1243,7 @@ class H2Connection:
         :returns: Nothing
         """
         self.config.logger.debug("Close connection")
+        previous_state = self.state_machine.state
         self.state_machine.process_input(ConnectionInputs.SEND_GOAWAY)
 
         # Additional_data must be bytes
@@ -1102,6 +1252,27 @@ class H2Connection:
 
         if last_stream_id is None:
             last_stream_id = self.highest_inbound_stream_id
+
+        if error_code != ErrorCodes.NO_ERROR or previous_state == ConnectionState.CLOSED:
+            # Error teardown, or another GOAWAY on a connection that was
+            # already fully closed: the connection stays closed straight away.
+            self.state_machine.state = ConnectionState.CLOSED
+        else:
+            # Graceful shutdown. RFC 9113 Section 5.2 forbids raising the
+            # last stream identifier once a GOAWAY has been sent, as the peer
+            # may already have retried the affected streams elsewhere.
+            if (self._local_last_stream_id is not None and
+                    last_stream_id > self._local_last_stream_id):
+                msg = (
+                    f"GOAWAY last_stream_id cannot increase from "
+                    f"{self._local_last_stream_id} to {last_stream_id}"
+                )
+                raise ProtocolError(msg)
+            self._local_last_stream_id = last_stream_id
+            # If the remote peer already sent us a graceful GOAWAY we keep
+            # draining in both directions; otherwise we now own the closing.
+            if self.state_machine.state != ConnectionState.REMOTE_CLOSING:
+                self.state_machine.state = ConnectionState.LOCAL_CLOSING
 
         f = GoAwayFrame(
             stream_id=0,
@@ -1590,6 +1761,9 @@ class H2Connection:
         f.last_stream_id = self.highest_inbound_stream_id
         f.error_code = error_code
         self.state_machine.process_input(ConnectionInputs.SEND_GOAWAY)
+        # An error GOAWAY is never graceful, even if a graceful shutdown was
+        # already in progress: the connection is done.
+        self.state_machine.state = ConnectionState.CLOSED
         self._prepare_for_sending([f])
 
     def _receive_headers_frame(self, frame: HeadersFrame) -> tuple[list[Frame], list[Event]]:
@@ -1609,6 +1783,19 @@ class H2Connection:
         # until we hang them off the event, at which point we may optionally
         # convert them to unicode.
         headers = _decode_headers(self.decoder, frame.data)
+
+        # If we have begun a graceful shutdown and this HEADERS frame opens a
+        # new inbound stream beyond the boundary we advertised, refuse it:
+        # the peer can safely retry the request on another connection. The
+        # headers still had to be decoded above to keep the HPACK decoder
+        # state in sync.
+        if (frame.stream_id not in self.streams and
+                self._local_last_stream_id is not None and
+                not self._stream_id_is_outbound(frame.stream_id) and
+                frame.stream_id > self._local_last_stream_id):
+            f = RstStreamFrame(frame.stream_id)
+            f.error_code = ErrorCodes.REFUSED_STREAM
+            return [f], []
 
         events = self.state_machine.process_input(
             ConnectionInputs.RECV_HEADERS,
@@ -1646,6 +1833,15 @@ class H2Connection:
         events = self.state_machine.process_input(
             ConnectionInputs.RECV_PUSH_PROMISE,
         )
+
+        # If we have begun a graceful shutdown, the remote peer must not push
+        # streams past the boundary we advertised. Refuse the pushed stream:
+        # the headers were still decoded above to keep HPACK state in sync.
+        if (self._local_last_stream_id is not None and
+                frame.promised_stream_id > self._local_last_stream_id):
+            f = RstStreamFrame(frame.promised_stream_id)
+            f.error_code = ErrorCodes.REFUSED_STREAM
+            return [f], events
 
         try:
             stream = self._get_stream_by_id(frame.stream_id)
@@ -1893,22 +2089,105 @@ class H2Connection:
     def _receive_goaway_frame(self, frame: GoAwayFrame) -> tuple[list[Frame], list[Event]]:
         """
         Receive a GOAWAY frame on the connection.
+
+        A GOAWAY frame with a non-zero error code tears the connection down
+        immediately, exactly as it always has. A GOAWAY frame with the error
+        code NO_ERROR begins (or continues) a graceful shutdown: the
+        connection keeps handling frames for streams the remote peer has
+        already accepted, while streams beyond the GOAWAY boundary become
+        retryable.
         """
+        previous_state = self.state_machine.state
         events = self.state_machine.process_input(
             ConnectionInputs.RECV_GOAWAY,
         )
 
-        # Clear the outbound data buffer: we cannot send further data now.
-        self.clear_outbound_data_buffer()
+        error_code = _error_code_from_int(frame.error_code)
 
         # Fire an appropriate ConnectionTerminated event.
         new_event = ConnectionTerminated()
-        new_event.error_code = _error_code_from_int(frame.error_code)
+        new_event.error_code = error_code
         new_event.last_stream_id = frame.last_stream_id
         new_event.additional_data = frame.additional_data or None
+        new_event.graceful = error_code == ErrorCodes.NO_ERROR
         events.append(new_event)
 
+        if (error_code != ErrorCodes.NO_ERROR or
+                previous_state == ConnectionState.CLOSED):
+            # Error teardown, or a (graceful) GOAWAY arriving on a connection
+            # that was already fully closed: nothing further may happen here.
+            # Clear the outbound data buffer: we cannot send further data
+            # now.
+            self.state_machine.state = ConnectionState.CLOSED
+            self.clear_outbound_data_buffer()
+            return [], events
+
+        # Graceful shutdown. If we already sent our own GOAWAY the connection
+        # is draining in both directions: the state machine stays in
+        # LOCAL_CLOSING, but the remote boundary still applies to our
+        # outbound streams.
+        if self.state_machine.state != ConnectionState.LOCAL_CLOSING:
+            self.state_machine.state = ConnectionState.REMOTE_CLOSING
+
+        # RFC 9113 Section 5.2: the last stream identifier in a GOAWAY frame
+        # MUST NOT be higher than in a previously received GOAWAY frame, as
+        # the peer may already have retried the affected streams elsewhere.
+        if (self._remote_last_stream_id is not None and
+                frame.last_stream_id > self._remote_last_stream_id):
+            msg = (
+                f"GOAWAY last_stream_id increased from "
+                f"{self._remote_last_stream_id} to {frame.last_stream_id}"
+            )
+            raise ProtocolError(msg)
+
+        self._remote_last_stream_id = frame.last_stream_id
+
+        events.extend(self._mark_streams_retryable(frame.last_stream_id))
+
         return [], events
+
+    def _mark_streams_retryable(self, last_stream_id: int) -> list[Event]:
+        """
+        Mark every locally-initiated stream with an ID higher than
+        ``last_stream_id`` as retryable: the remote peer has told us it never
+        accepted those streams, so the requests on them were never processed
+        and may be safely retried on a new connection.
+
+        Returns a list of :class:`StreamRetryable <h2.events.StreamRetryable>`
+        events, one for each newly-retryable stream.
+        """
+        events: list[Event] = []
+
+        for stream_id in sorted(self.streams):
+            if stream_id <= last_stream_id:
+                continue
+            if not self._stream_id_is_outbound(stream_id):
+                continue
+            if stream_id in self._retryable_stream_ids:
+                continue
+
+            stream = self.streams[stream_id]
+            # A stream that has already finished (for example, because an
+            # earlier GOAWAY still covered it) must not be retried: the peer
+            # did process it, and retrying would duplicate the request.
+            if stream.closed:
+                continue
+
+            self._retryable_stream_ids.add(stream_id)
+
+            # Retire the stream: it will never make further progress on this
+            # connection. We don't send a RST_STREAM for it: the GOAWAY frame
+            # already told the remote peer everything it needs to know.
+            stream.state_machine.process_input(
+                StreamInputs.SEND_RST_STREAM,
+            )
+
+            event = StreamRetryable()
+            event.stream_id = stream_id
+            event.last_stream_id = last_stream_id
+            events.append(event)
+
+        return events
 
     def _receive_naked_continuation(self, frame: ContinuationFrame) -> None:
         """
